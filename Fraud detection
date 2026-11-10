@@ -1,0 +1,146 @@
+#IMPORT AND SETUP
+
+import os
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import (ConfusionMatrixDisplay, classification_report,
+                             confusion_matrix, roc_auc_score, roc_curve,
+                             average_precision_score)
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+
+RANDOM_STATE = 42
+DATA_PATH = os.environ.get("FRAUD_DATA", "data/creditcard.csv")
+os.makedirs("models", exist_ok=True)
+os.makedirs("images", exist_ok=True)
+
+# # 1. Load ---------------------------------------------------------------
+df = pd.read_csv(DATA_PATH)
+print("Shape:", df.shape)
+print(df["Class"].value_counts().rename({0: "Normal", 1: "Fraud"}))
+print("Missing values:", int(df.isnull().sum().sum()))
+
+# Class distribution plot
+plt.figure(figsize=(5, 4))
+sns.countplot(x="Class", data=df)
+plt.yscale("log")
+plt.title("Class distribution (log scale)")
+plt.xticks([0, 1], ["Normal", "Fraud"])
+plt.tight_layout()
+plt.savefig("images/class_distribution.png", dpi=150)
+plt.show()
+
+# 2. Preprocess ---------------------------------------------------------
+df = df.drop_duplicates()
+scaler = StandardScaler()
+df[["Time", "Amount"]] = scaler.fit_transform(df[["Time", "Amount"]])
+
+X = df.drop("Class", axis=1)
+y = df["Class"]
+feature_names = list(X.columns)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE)
+print("Train:", X_train.shape, "Test:", X_test.shape)
+
+# 3. Balance (training data only - never the test set) ------------------
+X_train_bal, y_train_bal = SMOTE(random_state=RANDOM_STATE).fit_resample(X_train, y_train)
+print("After SMOTE:", np.bincount(y_train_bal))
+
+
+# 4. Anomaly detection --------------------------------------------------
+fraud_ratio = float(y_train.mean())
+
+# Isolation Forest (unsupervised)
+iso = IsolationForest(n_estimators=200, contamination=fraud_ratio,
+                      random_state=RANDOM_STATE, n_jobs=-1)
+iso.fit(X_train)
+iso_pred = (iso.predict(X_test) == -1).astype(int)   # -1 = anomaly
+iso_score = -iso.score_samples(X_test)               # higher = more anomalous
+print("\n=== Isolation Forest ===")
+print(classification_report(y_test, iso_pred, target_names=["Normal", "Fraud"], digits=4))
+
+# Local Outlier Factor (novelty mode; fitted on a sample for speed)
+lof_sample = X_train.sample(n=min(30000, len(X_train)), random_state=RANDOM_STATE)
+lof = LocalOutlierFactor(n_neighbors=20, contamination=fraud_ratio,
+                         novelty=True, n_jobs=-1)
+lof.fit(lof_sample.values)
+lof_pred = (lof.predict(X_test.values) == -1).astype(int)
+lof_score = -lof.score_samples(X_test.values)
+print("=== Local Outlier Factor ===")
+print(classification_report(y_test, lof_pred, target_names=["Normal", "Fraud"], digits=4))
+
+
+# 5. XGBoost classifier -------------------------------------------------
+xgb = XGBClassifier(
+    n_estimators=300, max_depth=6, learning_rate=0.1,
+    subsample=0.8, colsample_bytree=0.8,
+    eval_metric="logloss", random_state=RANDOM_STATE, n_jobs=-1)
+xgb.fit(X_train_bal, y_train_bal)
+
+xgb_proba = xgb.predict_proba(X_test)[:, 1]
+xgb_pred = (xgb_proba >= 0.5).astype(int)
+print("=== XGBoost ===")
+print(classification_report(y_test, xgb_pred, target_names=["Normal", "Fraud"], digits=4))
+
+
+# 6. Evaluation ---------------------------------------------------------
+# Confusion matrix
+cm = confusion_matrix(y_test, xgb_pred)
+fig, ax = plt.subplots(figsize=(5, 4))
+ConfusionMatrixDisplay(cm, display_labels=["Normal", "Fraud"]).plot(
+    ax=ax, cmap="Blues", values_format="d", colorbar=False)
+ax.set_title("XGBoost - Confusion Matrix")
+plt.tight_layout()
+plt.savefig("images/confusion_matrix.png", dpi=150)
+plt.show()
+
+# ROC curves
+plt.figure(figsize=(6, 5))
+results = {}
+for name, score in [("XGBoost", xgb_proba),
+                    ("Isolation Forest", iso_score),
+                    ("Local Outlier Factor", lof_score)]:
+    fpr, tpr, _ = roc_curve(y_test, score)
+    auc = roc_auc_score(y_test, score)
+    results[name] = auc
+    plt.plot(fpr, tpr, label=f"{name} (AUC = {auc:.3f})")
+plt.plot([0, 1], [0, 1], "k--", label="Random")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve Comparison")
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.savefig("images/roc_curve.png", dpi=150)
+plt.show()
+
+print("ROC-AUC:", {k: round(v, 4) for k, v in results.items()})
+print("XGBoost PR-AUC:", round(average_precision_score(y_test, xgb_proba), 4))
+
+# Feature importance
+imp = pd.Series(xgb.feature_importances_, index=feature_names).sort_values().tail(15)
+plt.figure(figsize=(6, 5))
+imp.plot(kind="barh")
+plt.title("Top 15 feature importances (XGBoost)")
+plt.tight_layout()
+plt.savefig("images/feature_importance.png", dpi=150)
+plt.show()
+
+
+# 7. Save artifacts for the app ----------------------------------------
+joblib.dump(xgb, "models/xgb_model.joblib")
+joblib.dump(scaler, "models/scaler.joblib")
+joblib.dump(feature_names, "models/feature_names.joblib")
+# a few real test rows (unscaled) for the app's "load example" buttons
+raw = pd.read_csv(DATA_PATH).drop_duplicates()
+raw.loc[raw["Class"] == 1].head(20).to_csv("data/sample_fraud.csv", index=False)
+raw.loc[raw["Class"] == 0].head(20).to_csv("data/sample_normal.csv", index=False)
+print("\nSaved model, scaler, plots and sample files.")
