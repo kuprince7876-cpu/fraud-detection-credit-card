@@ -1,0 +1,12 @@
+# Dataset
+
+Download **creditcard.csv** from Kaggle:
+https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+
+and place it in this folder as `data/creditcard.csv`.
+
+- 284,807 transactions made by European cardholders in September 2013
+- 492 frauds (0.172%) -> extremely imbalanced
+- Columns: `Time`, `V1`-`V28` (PCA-transformed), `Amount`, `Class` (1 = fraud)
+
+The file is not committed because it is too large for a normal GitHub repo.
