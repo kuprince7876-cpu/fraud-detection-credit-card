@@ -1,0 +1,7 @@
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
+# Kaggle dataset is ~150 MB - download it yourself (see data/README.md)
+data/creditcard.csv
