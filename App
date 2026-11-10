@@ -1,0 +1,98 @@
+"""
+Streamlit dashboard for credit card fraud prediction.
+Run:  streamlit run app.py   (after running train.py once)
+"""
+import os
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Credit Card Fraud Detection", page_icon="💳", layout="wide")
+
+
+@st.cache_resource
+def load_artifacts():
+    model = joblib.load("models/xgb_model.joblib")
+    scaler = joblib.load("models/scaler.joblib")
+    features = joblib.load("models/feature_names.joblib")
+    return model, scaler, features
+
+
+def predict(df_raw, model, scaler, features):
+    """df_raw has raw Time/Amount; returns fraud probability per row."""
+    df = df_raw.copy()
+    df[["Time", "Amount"]] = scaler.transform(df[["Time", "Amount"]])
+    return model.predict_proba(df[features])[:, 1]
+
+
+st.title("💳 Credit Card Fraud Detection")
+st.caption("XGBoost classifier trained on the Kaggle credit card dataset (SMOTE-balanced).")
+
+if not os.path.exists("models/xgb_model.joblib"):
+    st.error("Model not found. Run `python train.py` first.")
+    st.stop()
+
+model, scaler, features = load_artifacts()
+threshold = st.sidebar.slider("Fraud threshold", 0.05, 0.95, 0.50, 0.05,
+                              help="Flag a transaction as fraud if probability >= threshold")
+
+tab1, tab2 = st.tabs(["Single transaction", "Batch CSV upload"])
+
+# ---- Single transaction ------------------------------------------------
+with tab1:
+    st.subheader("Enter transaction details")
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Load example: normal"):
+        if os.path.exists("data/sample_normal.csv"):
+            st.session_state["row"] = pd.read_csv("data/sample_normal.csv").iloc[0][features].to_dict()
+    if c2.button("Load example: fraud"):
+        if os.path.exists("data/sample_fraud.csv"):
+            st.session_state["row"] = pd.read_csv("data/sample_fraud.csv").iloc[0][features].to_dict()
+    if c3.button("Reset"):
+        st.session_state.pop("row", None)
+
+    row = st.session_state.get("row", {f: 0.0 for f in features})
+
+    a, b = st.columns(2)
+    time_val = a.number_input("Time (seconds since first transaction)", value=float(row["Time"]))
+    amount = b.number_input("Amount", value=float(row["Amount"]), min_value=0.0)
+
+    with st.expander("PCA features V1 - V28", expanded=False):
+        cols = st.columns(4)
+        vals = {}
+        for i in range(1, 29):
+            vals[f"V{i}"] = cols[(i - 1) % 4].number_input(
+                f"V{i}", value=float(row[f"V{i}"]), format="%.4f", key=f"V{i}_{row['V1']}")
+
+    if st.button("Predict", type="primary"):
+        data = {"Time": time_val, **vals, "Amount": amount}
+        X = pd.DataFrame([data])[features]
+        p = float(predict(X, model, scaler, features)[0])
+        st.metric("Fraud probability", f"{p:.2%}")
+        st.progress(min(p, 1.0))
+        if p >= threshold:
+            st.error("🚨 Prediction: FRAUDULENT transaction")
+        else:
+            st.success("✅ Prediction: Legitimate transaction")
+
+# ---- Batch --------------------------------------------------------------
+with tab2:
+    st.subheader("Upload a CSV of transactions")
+    st.write("Required columns: `Time`, `V1`-`V28`, `Amount` (a `Class` column is optional).")
+    up = st.file_uploader("CSV file", type="csv")
+    if up is not None:
+        data = pd.read_csv(up)
+        missing = [c for c in features if c not in data.columns]
+        if missing:
+            st.error(f"Missing columns: {missing}")
+        else:
+            probs = predict(data[features], model, scaler, features)
+            out = data.copy()
+            out["fraud_probability"] = probs
+            out["prediction"] = np.where(probs >= threshold, "Fraud", "Legitimate")
+            st.write(f"**{(probs >= threshold).sum()}** of **{len(out)}** transactions flagged as fraud")
+            st.dataframe(out, use_container_width=True)
+            st.download_button("Download results", out.to_csv(index=False).encode(),
+                               "predictions.csv", "text/csv")
